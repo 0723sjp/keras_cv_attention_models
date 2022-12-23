@@ -248,7 +248,7 @@ def assign_anchor_classes_by_iou_with_bboxes(bbox_labels, anchors, ignore_thresh
     return rr
 
 
-def yolor_assign_anchors(bbox_labels, anchor_ratios, feature_sizes, anchor_aspect_thresh=4.0, overlap_offset=0.5):
+def yolor_assign_anchors0(bbox_labels, anchor_ratios, feature_sizes, anchor_aspect_thresh=4.0, overlap_offset=0.5):
     """
     # Actual assigning test:
     >>> from keras_cv_attention_models import yolor, test_images

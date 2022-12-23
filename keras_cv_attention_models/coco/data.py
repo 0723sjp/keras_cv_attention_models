@@ -343,7 +343,7 @@ class PositionalRandAugmentWithBboxes:
 
 def to_one_hot_with_class_mark(anchor_bboxes_with_label, num_classes=80):
     # dest_boxes, anchor_classes = anchor_bboxes_with_label[:, :4], anchor_bboxes_with_label[:, -1]
-    dest_boxes, anchor_classes = tf.split(anchor_bboxes_with_label, [4, 1], axis=-1)
+    dest_boxes, anchor_classes = tf.split(anchor_bboxes_with_label, [-1, 1], axis=-1)
     one_hot_labels = tf.one_hot(tf.cast(anchor_classes[..., 0], "int32") - 1, num_classes)  # [1, 81] -> [0, 80]
     # Mark iou < ignore_threshold as 0, ignore_threshold < iou < overlap_threshold as -1, iou > overlap_threshold as 1
     marks = tf.where(anchor_classes > 0, tf.ones_like(anchor_classes), anchor_classes)
@@ -370,6 +370,48 @@ def __yolor_bboxes_labels_batch_func__(bboxes, labels, anchor_ratios, feature_si
         lambda: empty_label,
     )
     return tf.map_fn(bbox_process, bbox_labels)
+
+
+def gathered_post_augment_anchors_pipeline(
+    train_dataset,
+    test_dataset=None,
+    anchors_mode="efficientdet",
+    anchor_pyramid_levels=[3, 7],
+    anchor_scale=4,  # For efficientdet anchors only
+    aspect_ratios=(1, 2, 0.5),  # For efficientdet anchors only
+    num_scales=3,  # For efficientdet anchors only
+    rescale_mode="torch",  # rescale mode, ["tf", "torch"], or specific `(mean, std)` like `(128.0, 128.0)`
+    num_classes=80,
+):
+    input_shape = train_dataset.element_spec[0].shape[1:3]
+    if anchors_mode == anchors_func.ANCHOR_FREE_MODE:  # == "anchor_free"
+        # Don't need anchors here, anchor assigning is after getting model predictions.
+        bbox_process = lambda bb: to_one_hot_with_class_mark(tf.concat([bb[0], tf.cast(tf.expand_dims(bb[1], -1), bb[0].dtype)], axis=-1), num_classes)
+    elif anchors_mode == anchors_func.YOLOR_MODE:  # == "yolor":
+        anchor_ratios, feature_sizes = anchors_func.get_yolor_anchors(input_shape[:2], anchor_pyramid_levels, is_for_training=True)
+        total_anchors = tf.cast(anchor_ratios.shape[1] * tf.reduce_sum(feature_sizes[:, 0] * feature_sizes[:, 1]), tf.int32)
+        empty_label = tf.zeros([total_anchors, 4 + num_classes + 1])  # All 0
+        bbox_process = lambda bb: __yolor_bboxes_labels_batch_func__(bb[0], bb[1], anchor_ratios, feature_sizes, empty_label, num_classes)
+    else:
+        # grid_zero_start = True if anchor_grid_zero_start == "auto" else anchor_grid_zero_start
+        grid_zero_start = False  # Use this till meet some others new
+        anchors = anchors_func.get_anchors(input_shape[:2], anchor_pyramid_levels, aspect_ratios, num_scales, anchor_scale, grid_zero_start)
+        num_anchors = anchors.shape[0]
+        empty_label = tf.zeros([num_anchors, 4 + num_classes + 1])  # All 0
+        bbox_process = lambda bb: __bboxes_labels_batch_func__(bb[0], bb[1], anchors, empty_label, num_classes)
+    # return bbox_process
+
+    AUTOTUNE = tf.data.AUTOTUNE
+    mean, std = init_mean_std_by_rescale_mode(rescale_mode)
+    rescaling = lambda xx: (xx - mean) / std
+    train_dataset = train_dataset.map(lambda xx, yy: (rescaling(xx), bbox_process(yy)), num_parallel_calls=AUTOTUNE)
+    train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
+    # return train_dataset
+
+    """ Test dataset """
+    if test_dataset is not None:
+        test_dataset = test_dataset.map(lambda xx, yy: (rescaling(xx), bbox_process(yy)))
+    return train_dataset, test_dataset
 
 
 def detection_dataset_from_custom_json(data_path, with_info=False):
@@ -431,7 +473,6 @@ def init_dataset(
         return total_images, num_classes, steps_per_epoch
 
     AUTOTUNE = tf.data.AUTOTUNE
-
     train_process = RandomProcessImageWithBboxes(
         target_shape=input_shape,
         max_labels_per_image=max_labels_per_image,
@@ -461,35 +502,18 @@ def init_dataset(
         pos_aug = PositionalRandAugmentWithBboxes(magnitude, num_layers, max_labels_per_image, positional_augment_methods, **augment_kwargs)
         print(">>>> positional augment methods:", pos_aug.pos_randaug.available_ops)
         train_dataset = train_dataset.map(pos_aug, num_parallel_calls=AUTOTUNE)
-
-    if anchors_mode == anchors_func.ANCHOR_FREE_MODE:  # == "anchor_free"
-        # Don't need anchors here, anchor assigning is after getting model predictions.
-        bbox_process = lambda bb: to_one_hot_with_class_mark(tf.concat([bb[0], tf.cast(tf.expand_dims(bb[1], -1), bb[0].dtype)], axis=-1), num_classes)
-    elif anchors_mode == anchors_func.YOLOR_MODE:  # == "yolor":
-        anchor_ratios, feature_sizes = anchors_func.get_yolor_anchors(input_shape[:2], anchor_pyramid_levels, is_for_training=True)
-        total_anchors = tf.cast(anchor_ratios.shape[1] * tf.reduce_sum(feature_sizes[:, 0] * feature_sizes[:, 1]), tf.int32)
-        empty_label = tf.zeros([total_anchors, 4 + num_classes + 1])  # All 0
-        bbox_process = lambda bb: __yolor_bboxes_labels_batch_func__(bb[0], bb[1], anchor_ratios, feature_sizes, empty_label, num_classes)
-    else:
-        # grid_zero_start = True if anchor_grid_zero_start == "auto" else anchor_grid_zero_start
-        grid_zero_start = False  # Use this till meet some others new
-        anchors = anchors_func.get_anchors(input_shape[:2], anchor_pyramid_levels, aspect_ratios, num_scales, anchor_scale, grid_zero_start)
-        num_anchors = anchors.shape[0]
-        empty_label = tf.zeros([num_anchors, 4 + num_classes + 1])  # All 0
-        bbox_process = lambda bb: __bboxes_labels_batch_func__(bb[0], bb[1], anchors, empty_label, num_classes)
-
-    mean, std = init_mean_std_by_rescale_mode(rescale_mode)
-    rescaling = lambda xx: (xx - mean) / std
-    train_dataset = train_dataset.map(lambda xx, yy: (rescaling(xx), bbox_process(yy)), num_parallel_calls=AUTOTUNE)
-    train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
     # return train_dataset
 
     """ Test dataset """
     test_dataset = dataset.get("validation", dataset.get("test", None))
     if test_dataset is not None:
         test_process = RandomProcessImageWithBboxes(target_shape=input_shape, resize_method=resize_method, resize_antialias=resize_antialias, magnitude=-1)
-        test_dataset = test_dataset.map(test_process).batch(batch_size, drop_remainder=is_tpu).map(lambda xx, yy: (rescaling(xx), bbox_process(yy)))
+        test_dataset = test_dataset.map(test_process).batch(batch_size, drop_remainder=is_tpu)
 
+    """ Anchors process """
+    train_dataset, test_dataset = gathered_post_augment_anchors_pipeline(
+        train_dataset, test_dataset, anchors_mode, anchor_pyramid_levels, anchor_scale, aspect_ratios, num_scales, rescale_mode, num_classes
+    )
     return train_dataset, test_dataset, total_images, num_classes, steps_per_epoch
 
 

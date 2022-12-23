@@ -278,7 +278,7 @@ class AnchorFreeLoss(tf.keras.losses.Loss):
 
 
 @tf.keras.utils.register_keras_serializable(package="kecamLoss")
-class YOLORLossWithBbox(tf.keras.losses.Loss):
+class YOLORLossWithBbox0(tf.keras.losses.Loss):
     """
     # Test with dataset:
     >>> from keras_cv_attention_models import coco, yolor
@@ -321,7 +321,8 @@ class YOLORLossWithBbox(tf.keras.losses.Loss):
         OBJECT_LEVEL_WEIGHTS = {3: [4.0, 1.0, 0.4], 4: [4.0, 1.0, 0.4, 0.1], 5: [4.0, 1.0, 0.5, 0.4, 0.1]}  # balance in original yolor loss
         object_level_weights = []
         for feature_size, object_level_weight in zip(feature_sizes, OBJECT_LEVEL_WEIGHTS.get(num_pyramid_levels, OBJECT_LEVEL_WEIGHTS[5])):
-            object_level_weights.extend([object_level_weight] * (feature_size[0] * feature_size[1] * 3))
+            cur_feature_size = feature_size[0] * feature_size[1] * 3
+            object_level_weights.extend([object_level_weight / cur_feature_size] * cur_feature_size)
         # self.object_level_weights = tf.convert_to_tensor(object_level_weights) * (1.4 if num_pyramid_levels >= 4 else 1.0)
         self.object_level_weights = tf.convert_to_tensor(object_level_weights)
         self.feature_split = [feature_size[0] * feature_size[1] * 3 for feature_size in feature_sizes]
@@ -347,6 +348,13 @@ class YOLORLossWithBbox(tf.keras.losses.Loss):
         pred_bottom_right = pred_top_left + y_pred_valid_hw
         return __bbox_iou__(true_top_left, true_bottom_right, true_hw, pred_top_left, pred_bottom_right, y_pred_valid_hw, use_ciou=True)
 
+    def create_num_valid_each_level(self, anchor_mark):
+        # Original using calculation like sum(mean(loss)) at each pyramid level
+        num_valid_each_level = [tf.zeros_like(ii) + tf.reduce_sum(ii) for ii in tf.split(anchor_mark, self.feature_split, axis=-1)]
+        num_valid_each_level = tf.concat(num_valid_each_level, axis=-1)  # [batch, total_anchors], num valid for each pyramid level
+        num_valid_each_level = tf.maximum(tf.gather_nd(num_valid_each_level, valid_pick), 1)
+        return num_valid_each_level
+
     def call(self, y_true, y_pred):
         if self.from_logits:
             y_pred = tf.sigmoid(y_pred)
@@ -355,10 +363,142 @@ class YOLORLossWithBbox(tf.keras.losses.Loss):
         anchor_mark = y_true[:, :, -1]
         valid_pick = tf.where(anchor_mark == 1)
 
-        # Original using calculation like sum(mean(loss)) at each pyramid level
-        num_valid_each_level = [tf.zeros_like(ii) + tf.reduce_sum(ii) for ii in tf.split(anchor_mark, self.feature_split, axis=-1)]
-        num_valid_each_level = tf.concat(num_valid_each_level, axis=-1)  # [batch, total_anchors], num valid for each pyramid level
-        num_valid_each_level = tf.maximum(tf.gather_nd(num_valid_each_level, valid_pick), 1)
+        num_valid_each_level = self.create_num_valid_each_level(anchor_mark)
+
+        # tf.gather_nd works better than tf.gather
+        y_true_valid, y_pred_valid = tf.gather_nd(y_true, valid_pick), tf.gather_nd(y_pred, valid_pick)
+        anchor_ratios = tf.gather_nd(tf.repeat(self.anchor_ratios, batch_size, axis=0), valid_pick)
+
+        iou = self.__bbox_decode_and_ciou__(y_true_valid, y_pred_valid, anchor_ratios)
+        # bbox_loss = tf.reduce_mean(1 - iou) * self.loss_scale
+        bbox_loss = tf.reduce_sum((1 - iou) / num_valid_each_level) * self.loss_scale
+
+        # tobj[b, a, gj, gi] = (1.0 - model.gr) + model.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio, gr = 1.0
+        object_true = tf.tensor_scatter_nd_update(tf.zeros_like(y_pred[:, :, -1]), valid_pick, tf.maximum(iou, 0))
+        object_loss = K.binary_crossentropy(object_true, y_pred[:, :, -1])
+        # print(object_true.shape, object_loss.shape, self.object_level_weights.shape)
+        object_loss = tf.reduce_sum(object_loss * self.object_level_weights) * self.loss_scale
+
+        class_true_valid, class_pred_valid = y_true_valid[:, 4:-1], y_pred_valid[:, 4:-1]
+
+        if self.gamma > 0:
+            class_loss = tf.losses.binary_focal_crossentropy(class_true_valid, class_pred_valid, gamma=self.gamma, label_smoothing=self.label_smoothing)
+        else:
+            class_loss = tf.losses.binary_crossentropy(class_true_valid, class_pred_valid, label_smoothing=self.label_smoothing)
+        # class_loss = tf.reduce_mean(class_loss) * self.loss_scale
+        class_loss = tf.reduce_sum(class_loss / num_valid_each_level) * self.loss_scale
+
+        # Calulate accuracy here, will use it in metrics
+        self.class_acc.assign(tf.reduce_mean(tf.cast(tf.argmax(class_pred_valid, axis=-1) == tf.argmax(class_true_valid, axis=-1), "float32")))
+
+        # return bbox_loss
+        tf.print(" - cls_loss:", class_loss, "- bbox_loss:", bbox_loss, "- obj_loss:", object_loss, end="\r")
+        # tf.print(" - cls_loss:", class_loss * self.class_loss_weight, "- bbox_loss:", bbox_loss * self.bbox_loss_weight, "- obj_loss:", object_loss, end="\r")
+        return class_loss * self.class_loss_weight + bbox_loss * self.bbox_loss_weight + object_loss * self.object_loss_weight
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "input_shape": self.input_shape,
+                "pyramid_levels": self.pyramid_levels,
+                "gamma": self.gamma,
+                "class_loss_weight": self.class_loss_weight,
+                "bbox_loss_weight": self.bbox_loss_weight,
+                "object_loss_weight": self.object_loss_weight,
+                "label_smoothing": self.label_smoothing,
+                "from_logits": self.from_logits,
+            }
+        )
+        return config
+
+class YOLORLossWithBbox(tf.keras.losses.Loss):
+    def __init__(
+        self,
+        input_shape,
+        pyramid_levels=[3, 5],
+        gamma=0.0,
+        class_loss_weight=0.3,
+        bbox_loss_weight=0.05,
+        object_loss_weight=0.7,
+        label_smoothing=0.0,
+        from_logits=False,
+        **kwargs,
+    ):
+        # hyp.scratch.640: box: 0.05, cls: 0.3, obj: 0.7
+        # hyp.scratch.1280: box: 0.05, cls: 0.5, obj: 1.0 * 1.4 -> lobj *= h['obj'] * s * (1.4 if no >= 4 else 1.)
+        from keras_cv_attention_models.coco import anchors_func
+
+        self.num_pyramid_levels = max(pyramid_levels) - min(pyramid_levels) + 1
+        self.loss_scale = 3.0 / tf.cast(self.num_pyramid_levels, "float32")
+
+        feature_sizes = anchors_func.get_feature_sizes(input_shape, pyramid_levels)[min(pyramid_levels) : max(pyramid_levels) + 1]
+        OBJECT_LEVEL_WEIGHTS = {3: [4.0, 1.0, 0.4], 4: [4.0, 1.0, 0.4, 0.1], 5: [4.0, 1.0, 0.5, 0.4, 0.1]}  # balance in original yolor loss
+        object_level_weights = []
+        for feature_size, object_level_weight in zip(feature_sizes, OBJECT_LEVEL_WEIGHTS.get(self.num_pyramid_levels, OBJECT_LEVEL_WEIGHTS[5])):
+            object_level_weights.extend([object_level_weight] * (feature_size[0] * feature_size[1] * 3))
+        # self.object_level_weights = tf.convert_to_tensor(object_level_weights) * (1.4 if num_pyramid_levels >= 4 else 1.0)
+        self.object_level_weights = tf.convert_to_tensor(object_level_weights)
+        self.feature_split = [feature_size[0] * feature_size[1] * 3 for feature_size in feature_sizes]  # 3 is num_anchors
+
+        anchors = anchors_func.get_yolor_anchors(input_shape[:2], pyramid_levels, is_for_training=False)
+        anchor_ratios = anchors[:, 2:4] / anchors[:, 4:]  # Anchors is divided with strides in YOLOLayer
+        anchor_ratios = tf.expand_dims(anchor_ratios, 0)  # [1, total_anchors, 2], first dimension is batch, last dimension is anchor_ratio
+        self.anchor_ratios = tf.split(anchor_ratios, self.feature_split, axis=1)
+
+        super().__init__(**kwargs)
+        self.input_shape, self.pyramid_levels = input_shape, pyramid_levels
+        self.gamma, self.class_loss_weight, self.bbox_loss_weight, self.object_loss_weight = gamma, class_loss_weight, bbox_loss_weight, object_loss_weight
+        self.label_smoothing, self.from_logits = label_smoothing, from_logits
+
+        self.class_acc = tf.Variable(0, dtype="float32", trainable=False)
+
+    def __bbox_decode_and_ciou__(self, y_true_valid, y_pred_valid, anchor_ratios):
+        # compute_loss https://github.com/WongKinYiu/yolor/blob/main/utils/loss.py#L62
+        # true_center, true_hw = y_true_valid[:, :2], y_true_valid[:, 2:4]
+        true_center, true_hw, _ = tf.split(y_true_valid, [2, 2, -1], axis=-1)
+        true_top_left = true_center - true_hw / 2
+        true_bottom_right = true_top_left + true_hw
+
+        y_pred_valid_center, y_pred_valid_hw, _ = tf.split(y_pred_valid, [2, 2, -1], axis=-1)
+        y_pred_valid_center = y_pred_valid_center * 2 - 0.5
+        y_pred_valid_hw = (y_pred_valid_hw * 2) ** 2 * anchor_ratios
+        pred_top_left = y_pred_valid_center - y_pred_valid_hw / 2
+        pred_bottom_right = pred_top_left + y_pred_valid_hw
+        return losses.__bbox_iou__(true_top_left, true_bottom_right, true_hw, pred_top_left, pred_bottom_right, y_pred_valid_hw, use_ciou=True)
+
+    def __single_pyramid_feature_loss__(self, y_true, y_pred, anchor_ratios, balance):
+        anchor_mark = y_true[:, :, -1]
+        valid_pick = tf.where(anchor_mark == 1)
+
+        y_true_valid, y_pred_valid = tf.gather_nd(y_true, valid_pick), tf.gather_nd(y_pred, valid_pick)
+        iou = self.__bbox_decode_and_ciou__(y_true_valid, y_pred_valid, anchor_ratios)
+        bbox_loss = tf.reduce_mean(1 - iou) * self.loss_scale
+
+        object_true = tf.tensor_scatter_nd_update(tf.zeros_like(y_true[:, :, -1]), valid_pick, tf.maximum(iou, 0))
+        # object_loss = K.binary_crossentropy(object_true, y_pred[:, :, -1]) * balance
+        object_loss = tf.losses.binary_crossentropy(object_true, y_pred[:, :, -1], label_smoothing=self.label_smoothing) * balance
+
+        class_true_valid, class_pred_valid = y_true_valid[:, 4:-1], y_pred_valid[:, 4:-1]
+        if self.gamma > 0:
+            class_loss = tf.losses.binary_focal_crossentropy(class_true_valid, class_pred_valid, gamma=self.gamma, label_smoothing=self.label_smoothing)
+        else:
+            class_loss = tf.losses.binary_crossentropy(class_true_valid, class_pred_valid, label_smoothing=self.label_smoothing)
+
+        acc = tf.reduce_mean(tf.cast(tf.argmax(class_pred_valid, axis=-1) == tf.argmax(class_true_valid, axis=-1), "float32"))
+        return bbox_loss, tf.reduce_mean(object_loss), tf.reduce_mean(class_loss), acc
+
+
+    def call(self, y_true, y_pred):
+        if self.from_logits:
+            y_pred = tf.sigmoid(y_pred)
+
+        # y_true = tf.reshape(y_true, [batch_size, -1, 3, y_true.shape[-1]])  # 3 anchors
+        # y_pred = tf.reshape(y_pred, [batch_size, -1, 3, y_pred.shape[-1]])  # 3 anchors
+        pyramid_feature_pred = tf.split(y_pred, self.feature_split, axis=1)
+        pyramid_feature_True = tf.split(y_true, self.feature_split, axis=1)
+
+        num_valid_each_level = self.create_num_valid_each_level(anchor_mark)
 
         # tf.gather_nd works better than tf.gather
         y_true_valid, y_pred_valid = tf.gather_nd(y_true, valid_pick), tf.gather_nd(y_pred, valid_pick)

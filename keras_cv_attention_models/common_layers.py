@@ -28,6 +28,45 @@ def hard_sigmoid_torch(inputs):
     return tf.clip_by_value(inputs / 6 + 0.5, 0, 1)
 
 
+def integer_gelu(inputs):
+    """I-BERT: Integer-only BERT Quantization https://arxiv.org/abs/2101.01321
+    >>> xx = np.arange(-4, 4, 0.01)
+    >>> plt.plot(xx, tf.nn.gelu(xx), label='gelu')
+    >>> plt.plot(xx, tf.nn.gelu(xx, approximate=True), label='gelu approximate')
+    >>> plt.plot(xx, integer_gelu(xx), label='integer_gelu')
+    >>> plt.grid(True)
+    >>> plt.legend()
+    """
+    # popt = [-0.35576683, 1.18432683, 0.00830013]
+    popt = [-0.2888, -1.769, 1]
+
+    clipped_inputs = tf.clip_by_value(tf.abs(inputs / 1.4142135623730951), 0, 1.769)
+    # erf = tf.sign(inputs) * (popt[0] * clipped_inputs ** 2 + popt[1] * clipped_inputs + popt[2])
+    erf = tf.sign(inputs) * (popt[0] * (clipped_inputs + popt[1]) ** 2 + popt[2])
+    return 0.5 * inputs * (1.0 + erf)
+
+
+def integer_softmax(inputs):
+    """I-BERT: Integer-only BERT Quantization https://arxiv.org/abs/2101.01321
+    >>> xx = np.arange(-4, 4, 0.01)
+    >>> plt.plot(xx, tf.nn.softmax(xx), label='softmax')
+    >>> plt.plot(xx, integer_softmax(xx), label='integer_softmax')
+    >>> plt.grid(True)
+    >>> plt.legend()
+    """
+    ln_2, inv_ln_2 = 0.6931471805599453, -1.4426950408889634  # np.log(2), -1 / np.log(2)
+    pre = inputs - tf.reduce_max(inputs, -1, keepdims=True)
+
+    # pre == -zz * ln_2 + pp
+    zz = tf.math.floor(inv_ln_2 * pre)
+    pp = pre + zz * ln_2
+    # integer_exp = (0.3585 * (pp + 1.353) ** 2 + 0.344) / (2 ** zz)
+    integer_exp = (0.3565889 * (pp + 1.35002299) ** 2 + 0.3480172) / (2 ** zz)  # >> zz
+    # integer_exp = (0.11863702 * (pp + 1.34850172) ** 3 + 0.34980174 * pp + 0.70897763) / (2 ** zz)
+    rr = integer_exp / tf.reduce_sum(integer_exp, axis=-1, keepdims=True)
+    return rr
+
+
 @tf.keras.utils.register_keras_serializable(package="kecamCommon")
 def mish(inputs):
     """Mish: A Self Regularized Non-Monotonic Neural Activation Function.
